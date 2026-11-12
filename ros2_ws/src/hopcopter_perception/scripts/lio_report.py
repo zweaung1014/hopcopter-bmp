@@ -15,7 +15,7 @@ import sys
 
 import numpy as np
 
-DATA = '/home/zweminhtetaung/CrazySim/data/data_lio'
+DATA = '/home/zweminhtetaung/hopcopter-bmp/data/data_lio'
 
 
 def main():

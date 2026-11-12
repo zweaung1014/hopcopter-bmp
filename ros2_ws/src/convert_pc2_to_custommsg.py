@@ -25,8 +25,8 @@ except Exception as e:
 
 # -------------------------- 配置参数 --------------------------
 # Note: For rosbag2, INPUT_BAG_PATH and OUTPUT_BAG_PATH should point to directories
-INPUT_BAG_PATH = "/home/zweminhtetaung/CrazySim/ros2_ws/rosbag2_2025_10_15-14_28_18"   # directory containing *.db3
-OUTPUT_BAG_PATH = "/home/zweminhtetaung/CrazySim/ros2_ws/converted_bag_final"          # directory to be created
+INPUT_BAG_PATH = "/home/zweminhtetaung/hopcopter-bmp/ros2_ws/rosbag2_2025_10_15-14_28_18"   # directory containing *.db3
+OUTPUT_BAG_PATH = "/home/zweminhtetaung/hopcopter-bmp/ros2_ws/converted_bag_final"          # directory to be created
 LIDAR_TOPIC = "/cf_0/lidar/points"
 IMU_TOPICS = ["/livox/imu", "/livox/loc"]
 LIDAR_FREQ = 20.0  # 按雷达型号调整

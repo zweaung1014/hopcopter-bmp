@@ -13,7 +13,7 @@ import glob
 import os
 import sys
 
-DATA = '/home/zweminhtetaung/CrazySim/data/data_elevation_map'
+DATA = '/home/zweminhtetaung/hopcopter-bmp/data/data_elevation_map'
 
 
 def main():

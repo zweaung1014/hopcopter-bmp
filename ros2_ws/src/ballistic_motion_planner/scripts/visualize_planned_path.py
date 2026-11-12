@@ -23,7 +23,7 @@ import matplotlib.patches as mpatches  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
-DEFAULT_DIR = "/home/zweminhtetaung/CrazySim/data/data_ballistic_planner/vis_planned_path"
+DEFAULT_DIR = "/home/zweminhtetaung/hopcopter-bmp/data/data_ballistic_planner/vis_planned_path"
 OBSTACLE = -1.0
 
 

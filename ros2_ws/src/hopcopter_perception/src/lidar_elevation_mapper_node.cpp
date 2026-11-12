@@ -92,7 +92,7 @@ public:
     max_wait_ = declare_parameter("tf_max_wait", 1.0);  // [s] a cloud waits this long for its TF
     snapshot_period_ = declare_parameter("snapshot_period", 10.0);
     data_dir_ = declare_parameter(
-      "data_dir", std::string("/home/zweminhtetaung/CrazySim/data/data_elevation_map"));
+      "data_dir", std::string("/home/zweminhtetaung/hopcopter-bmp/data/data_elevation_map"));
     missed_obstacle_height_ = declare_parameter("score.missed_obstacle_height", 1.0);
     // The LiDAR runs at 10 Hz. More scans than this per second of scan time, or a
     // scan not newer than the last, means a second publisher on the cloud topic

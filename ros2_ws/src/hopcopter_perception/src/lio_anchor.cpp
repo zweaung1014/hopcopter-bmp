@@ -89,7 +89,7 @@ public:
     min_scans_ = declare_parameter("min_scans", 5);
     release_timeout_ = declare_parameter("release_timeout", 30.0);  // [s, sim] after the first truth pose
     data_dir_ = declare_parameter(
-      "data_dir", std::string("/home/zweminhtetaung/CrazySim/data/data_lio"));
+      "data_dir", std::string("/home/zweminhtetaung/hopcopter-bmp/data/data_lio"));
     single_pub_topics_ = declare_parameter("single_publisher_topics",
       std::vector<std::string>{"/lio/points", "/lio/imu", "/lidar/points"});
 

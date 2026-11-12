@@ -24,7 +24,7 @@ if '--show' not in sys.argv:
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.colors import ListedColormap  # noqa: E402
 
-DATA = '/home/zweminhtetaung/CrazySim/data/data_elevation_map'
+DATA = '/home/zweminhtetaung/hopcopter-bmp/data/data_elevation_map'
 
 
 def grid(snap, key):

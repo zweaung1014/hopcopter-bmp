@@ -387,7 +387,7 @@ class hopcopter(Node):
         csv_dir = os.path.normpath(csv_dir)
         # Fallback to a known absolute path if relative resolution fails
         if not os.path.isdir(csv_dir):
-            csv_dir = '/home/zweminhtetaung/CrazySim/data/data_hopcopter'
+            csv_dir = '/home/zweminhtetaung/hopcopter-bmp/data/data_hopcopter'
         os.makedirs(csv_dir, exist_ok=True)
         csv_filename = os.path.join(
             csv_dir,
@@ -405,7 +405,7 @@ class hopcopter(Node):
         self.get_logger().info(f'Landing-point CSV: {csv_filename}')
 
         # === Per-hop energy-tracking CSV logger ===
-        hop_dir = '/home/zweminhtetaung/CrazySim/data/data_ballistic_planner/hop_tracking'
+        hop_dir = '/home/zweminhtetaung/hopcopter-bmp/data/data_ballistic_planner/hop_tracking'
         os.makedirs(hop_dir, exist_ok=True)
         hop_csv_filename = os.path.join(
             hop_dir,
@@ -425,7 +425,7 @@ class hopcopter(Node):
         self.get_logger().info(f'Hop-tracking CSV: {hop_csv_filename}')
 
         # === Per-tick commanded-vs-actual attitude CSV logger ===
-        att_dir = '/home/zweminhtetaung/CrazySim/data/data_ballistic_planner/position_attitude_tracking'
+        att_dir = '/home/zweminhtetaung/hopcopter-bmp/data/data_ballistic_planner/position_attitude_tracking'
         os.makedirs(att_dir, exist_ok=True)
         att_csv_filename = os.path.join(
             att_dir,

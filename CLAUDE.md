@@ -56,7 +56,7 @@ under `crazyflie-firmware/tools/crazyflie-simulation/`). The project's own code 
 ## Build and run
 
 ```bash
-cd ~/CrazySim/ros2_ws
+cd ~/hopcopter-bmp/ros2_ws
 source /opt/ros/humble/setup.bash
 colcon build                                          # full workspace
 colcon build --packages-up-to ballistic_motion_planner   # the planner and hopcopter_msgs (builds Release by default)
@@ -130,8 +130,10 @@ the stance model (stage 4). Both read hopcopter's newest per-tick
 subscribes to the 2.5D `/elevation_map` (`grid_map_msgs/GridMap`, transient_local), the robot
 pose, and `/goal_pose`. On each goal it runs a hopping-aware **A\*** search over the elevation
 map (each move a physically feasible parabolic hop) and publishes the path **once** on a
-hand-made map. On a LiDAR map it re-checks the rest of the plan on every map update and replans
-from a hold when it fails (3b below). The path travels as a `Marker` SPHERE_LIST (id=400) on `/ballistic_trajectory`
+hand-made map. On a LiDAR map it re-checks the rest of the plan on every map update. When a hop
+fails, it cuts the plan before it and searches on from there in the background while the robot
+flies the good hops (`replan.cut`, docs/replan_cut_plan.md); a bad next landing still replans from
+a hold (3b below). The path travels as a `Marker` SPHERE_LIST (id=400) on `/ballistic_trajectory`
 (**waypoints travel as marker points, not a `nav_msgs/Path`**), with the robot's position at
 planning time on `/trajectory_start_position`. Per-waypoint z is the **`target_apex`** of the
 hop that lands on that waypoint — the planned apex height above that hop's takeoff ground
@@ -266,8 +268,8 @@ CHANGELOG.md the reasons for its parameters):
   - a hand-made map (no layer) keeps every finite cell landable.
 
   On a LiDAR map the planner also refuses an unmeasured start, makes frontier plans to goals not
-  yet seen, and holds and replans when the map invalidates the plan (`/hopcopter/apex_decision`
-  tells it which hops remain and when the robot hops in place).
+  yet seen, and cuts the plan when the map invalidates it (or, for a bad next landing, holds and
+  replans; `/hopcopter/apex_decision` tells it which hops remain and when the robot hops in place).
 - **Clocks.** The perception nodes run on sim time (`/clock` from the bridge); the planner,
   hopcopter and `elevation_map_publisher` on wall time, as before.
 
@@ -288,7 +290,7 @@ and controller work in the world frame) but is kept for RViz and legacy consumer
   side (`/cf_1/pose`, `/cf_1/cmd_vel_legacy`, `/cf_1/imu`), named by
   `ros2_ws/src/crazyswarm2/crazyflie/config/crazyflies.yaml`. `hopcopter` subscribes to both
   and the mismatch is intentional — do not "normalize" it.
-- **Absolute paths are hardcoded** to `/home/zweminhtetaung/CrazySim/data/...` in the CSV
+- **Absolute paths are hardcoded** to `/home/zweminhtetaung/hopcopter-bmp/data/...` in the CSV
   loggers (e.g. `hopcopter.py`, `ballistic_planner_node.cpp`; `lio_anchor` and
   `lidar_elevation_mapper` take a `data_dir` parameter). CSV logging breaks silently for any
   other checkout location.

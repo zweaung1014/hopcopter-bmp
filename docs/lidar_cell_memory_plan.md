@@ -135,7 +135,8 @@ so the floor points stay "too far below" and the run never completes.
 
 ## The stairs replan loop (2026-11-11/12): cause and fix
 
-Status: **diagnosed, not fixed** (no code changed). Fix it before Step 2.
+Status: **fix A implemented 2026-11-13** (docs/replan_cut_plan.md), not yet flown in the sim.
+Fix it before Step 2.
 
 ### What happens
 

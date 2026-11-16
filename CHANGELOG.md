@@ -3,6 +3,17 @@
 ## [Unreleased]
 
 ### Added
+- **The planner cuts a plan instead of deleting it** (docs/replan_cut_plan.md; fix A of the
+  stairs replan loop, docs/lidar_cell_memory_plan.md). On the stairs every plan was deleted
+  0.3–1.7 s after it went out: a cell beside a riser read wrong when planned and was corrected a
+  moment later, and one bad landing threw away the whole plan, so the robot never got close
+  enough for the map to settle. Now a re-check that fails past the hop the robot is committed to
+  republishes the plan up to the latest waypoint before the bad one that the robot can stop on
+  (the search's own stop test, 20° landing tilt). The robot flies those hops and hops in place
+  there; a search from there runs on a worker thread meanwhile (the node keeps re-checking), and
+  its plan goes out once hopcopter reports `goal` on that waypoint, after a re-check on the
+  newest map. The cut is not rate-limited. A bad next landing, frontier replans and holds keep
+  the DELETE and hold. `replan.cut:=false` restores the old behaviour. hopcopter is unchanged.
 - **Offline checks of the LiDAR map's edges and of plans on it.** `mapper_check` reports phantoms
   and sunken cells (against all the terrain under each cell) at planning time and at the end,
   the error on flat terrain, and the share of points taken for faces; `--shift <m>` moves the

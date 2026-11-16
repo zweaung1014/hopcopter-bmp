@@ -19,11 +19,16 @@
 // an unseen start. A goal the LiDAR has not seen yet gets a frontier plan to the
 // reachable cell nearest it. On every map update the remaining hops of the plan
 // are re-checked (landing still standable, its ground moved < 5 cm, every arc
-// still clears with its planned takeoff); when one fails, or a frontier plan can
-// now do better, or the robot gave up on the path (hold), the planner publishes
-// a DELETE alone, waits for the robot to hop in place, and plans again from
-// there, at most once per replan.min_interval. On a hand-made map (no
-// upper_bound layer) nothing changes: it plans once per /goal_pose.
+// still clears with its planned takeoff). When one fails past the hop the robot
+// is committed to, the plan is cut before it, at the latest waypoint the robot
+// can stop on; the robot flies the good hops and hops in place there, a search
+// from there runs on a worker thread meanwhile, and its plan goes out once the
+// robot hops in place on that waypoint (replan.cut, docs/replan_cut_plan.md).
+// Otherwise (a bad next landing; a frontier plan can now do better; the robot
+// gave up on the path, hold) the planner publishes a DELETE alone, waits for the
+// robot to hop in place, and plans again from there, at most once per
+// replan.min_interval. On a hand-made map (no upper_bound layer) nothing
+// changes: it plans once per /goal_pose.
 // CSVs (path + per-hop energy chain) go to data/data_ballistic_planner/.
 // A JSON snapshot (map layers + path + hop radii) goes to vis_planned_path/,
 // and scripts/visualize_planned_path.py renders it to a PNG in the background.
@@ -36,6 +41,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <algorithm>
 #include <limits>
@@ -153,6 +159,10 @@ public:
     replan_height_tol_ = declare_parameter("replan.height_tolerance", 0.05);  // [m]
     replan_hold_wait_ = declare_parameter("replan.hold_wait", 1.0);         // [s] after the DELETE
     replan_hold_timeout_ = declare_parameter("replan.hold_timeout", 4.0);   // [s]
+    // A re-check that fails past the next landing cuts the plan before the bad hop, and the
+    // search from there runs in the background while the robot flies the good hops; false:
+    // always DELETE and hold (docs/replan_cut_plan.md).
+    replan_cut_ = declare_parameter("replan.cut", true);
     const auto map_topic = declare_parameter("topics.map", std::string("/elevation_map"));
     const auto traj_topic = declare_parameter("topics.trajectory", std::string("/ballistic_trajectory"));
     const auto plan_topic = declare_parameter("topics.hop_plan", std::string("/ballistic_hop_plan"));
@@ -221,6 +231,22 @@ public:
   }
 
 private:
+  enum class ReplanState {kIdle, kWaitHold};
+  // The plan hopcopter flies, as the replan check compares it with each new map.
+  struct ActivePlan
+  {
+    bool valid = false;
+    bool frontier = false;
+    bool cut = false;    // cut before a bad hop: its last waypoint is a stop, not the goal
+    double stamp = 0.0;  // the marker's stamp [s]: hopcopter's path_id
+    double sx = 0.0, sy = 0.0, tx = 0.0, ty = 0.0;  // where it was planned from, and to
+    std::vector<std::pair<double, double>> path;
+    std::vector<ballistic::Hop> hops;
+    // [0] the start into hops[0], [i] the landing on path[i] into hops[i], last: the stop
+    std::vector<ballistic::Stance> stances;
+    std::vector<double> ground;  // the map's height at each waypoint when planned
+  };
+
   void goalCallback(const geometry_msgs::msg::PoseStamped & msg)
   {
     if (!latest_map_msg_) {
@@ -239,30 +265,49 @@ private:
     goal_reached_ = false;
     failed_plans_ = 0;
     replan_state_ = ReplanState::kIdle;
+    dropCutSearch();
     planAndPublish(robot_x_, robot_y_, "goal");
   }
 
-  // Plan from (sx, sy) to the goal and publish it. On a LiDAR map whose goal is
-  // not standable yet, plan to the reachable cell nearest it instead (a frontier
-  // plan). Returns whether a plan went out.
-  bool planAndPublish(double sx, double sy, const std::string & why)
+  // One search and what it found. map is declared before planner, which refers to it.
+  struct SearchResult
   {
-    last_plan_time_ = std::chrono::steady_clock::now();
+    bool searched = false;  // false: refused before searching (off the map, unseen start, ...)
+    bool found = false;
+    std::string why;
+    double sx = 0.0, sy = 0.0, tx = 0.0, ty = 0.0;
+    bool frontier = false;
+    uint64_t gen = 0;  // the cut search's generation (cut_gen_ when it started)
+    std::unique_ptr<ballistic::Map2D5> map;
+    std::unique_ptr<ballistic::HoppingAStarPlanner> planner;
+    std::vector<std::pair<double, double>> path;
+  };
+
+  // Plan from (sx, sy) to (gx, gy) on msg. On a LiDAR map whose goal is not standable yet,
+  // plan to the reachable cell nearest it instead (a frontier plan). Publishes nothing and
+  // touches no member but the logger, so it can run on a worker thread (the cut search).
+  std::unique_ptr<SearchResult> search(
+    const grid_map_msgs::msg::GridMap & msg, double sx, double sy, double gx, double gy,
+    const std::string & why)
+  {
+    auto r = std::make_unique<SearchResult>();
+    r->why = why;
+    r->sx = sx;
+    r->sy = sy;
     try {
       const auto t0 = std::chrono::steady_clock::now();
-      const auto map = convertMap(*latest_map_msg_);
-      const double gx = goal_x_, gy = goal_y_;
+      auto map = convertMap(msg);
       if (!map->is_within_bounds(sx, sy)) {
         RCLCPP_ERROR(get_logger(),
           "Robot position (%.2f, %.2f) is outside the map "
           "[%.2f, %.2f] x [%.2f, %.2f] — refusing to plan.",
           sx, sy, map->origin_x(), map->origin_x() + map->size_x(),
           map->origin_y(), map->origin_y() + map->size_y());
-        return false;
+        return r;
       }
       if (!map->is_within_bounds(gx, gy)) {
         RCLCPP_ERROR(get_logger(), "Goal (%.2f, %.2f) is outside the map — refusing to plan.", gx, gy);
-        return false;
+        return r;
       }
       // Start guard: an unseen start would carry its upper bound (or OBSTACLE)
       // as its height, and every hop would be planned from it.
@@ -270,7 +315,7 @@ private:
         RCLCPP_ERROR(get_logger(),
           "The start cell (%.2f, %.2f) has no measured height yet — refusing to plan. "
           "(The mapper writes the start disk at the first touchdown.)", sx, sy);
-        return false;
+        return r;
       }
       const auto standable = map->standable_mask(p_.robot_radius, p_.side_clearance, p_.steep_grade);
       const auto [rg, cg] = map->world_to_grid(gx, gy);
@@ -284,18 +329,18 @@ private:
       if (lidar_map) {
         // Frontier candidates, nearest the goal first, kept apart by 0.5 m so a
         // failed search is not repeated next door.
-        for (const auto & [r, c] : ballistic::frontier_candidates(
+        for (const auto & [r_, c_] : ballistic::frontier_candidates(
             *map, standable, {sx, sy}, {gx, gy}, frontier_))
         {
           if (static_cast<int>(targets.size()) >= (goal_standable ? 1 : 0) + frontier_attempts_) {
             break;
           }
-          const auto xy = map->grid_to_world(r, c);
+          const auto xy = map->grid_to_world(r_, c_);
           bool apart = true;
           for (const auto & t : targets) {
             apart = apart && std::hypot(t.first - xy.first, t.second - xy.second) >= 0.5;
           }
-          if (apart && !(r == rg && c == cg)) {
+          if (apart && !(r_ == rg && c_ == cg)) {
             targets.push_back(xy);
           }
         }
@@ -304,16 +349,18 @@ private:
         RCLCPP_ERROR(get_logger(),
           "(%s) The goal (%.2f, %.2f) is not on measured, standable ground, and no measured cell "
           "the robot can reach is nearer it: waiting for the map.", why.c_str(), gx, gy);
-        return false;
+        return r;
       }
 
+      r->searched = true;
       const auto t1 = std::chrono::steady_clock::now();
       for (size_t k = 0; k < targets.size(); ++k) {
         const auto [tx, ty] = targets[k];
         const bool frontier = !(tx == gx && ty == gy);
-        ballistic::HoppingAStarPlanner planner(*map, {sx, sy}, {tx, ty}, p_);
+        auto planner = std::make_unique<ballistic::HoppingAStarPlanner>(
+          *map, std::make_pair(sx, sy), std::make_pair(tx, ty), p_);
         const auto ts = std::chrono::steady_clock::now();
-        auto path = planner.plan();
+        auto path = planner->plan();
         const auto te = std::chrono::steady_clock::now();
         const double prep_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         const double plan_ms = std::chrono::duration<double, std::milli>(te - ts).count();
@@ -322,88 +369,155 @@ private:
             "(%s) No path found from (%.2f, %.2f) to %s (%.2f, %.2f)%s "
             "[prep %.1f ms, search %.1f ms, %ld expansions].",
             why.c_str(), sx, sy, frontier ? "the frontier cell" : "the goal", tx, ty,
-            planner.recheck_failed() ?
+            planner->recheck_failed() ?
             ": the search's path exceeds the landing tilt cap with its exact arrival directions" : "",
-            prep_ms, plan_ms, planner.n_expansions());
+            prep_ms, plan_ms, planner->n_expansions());
           continue;
         }
         RCLCPP_INFO(get_logger(),
           "[TIMING] (%s) %s with %zu waypoints: map+fields %.1f ms, A* %.1f ms "
           "(%ld expansions, %ld edge checks, %ld accepted; %ld hops over the tilt cap, "
           "%ld over one push)", why.c_str(), frontier ? "Frontier path" : "Path", path->size(),
-          prep_ms, plan_ms, planner.n_expansions(), planner.n_edge_checks(),
-          planner.n_edges_accepted(), planner.n_tilt_rejects(), planner.n_push_rejects());
+          prep_ms, plan_ms, planner->n_expansions(), planner->n_edge_checks(),
+          planner->n_edges_accepted(), planner->n_tilt_rejects(), planner->n_push_rejects());
         if (frontier) {
           RCLCPP_WARN(get_logger(),
             "Goal (%.2f, %.2f) not on measured ground yet: frontier plan to (%.2f, %.2f), %.2f m "
             "from it; replanning when the goal is measured or the robot gets there.",
             gx, gy, tx, ty, std::hypot(tx - gx, ty - gy));
         }
-        logHopTable(planner);
-
-        // HopPlan first, then the marker pair, all with one stamp.
-        const auto now_stamp = now();
-        publishHopPlan(*map, *path, planner, now_stamp);
-        publishTrajectory(*path, planner.path_hops(), now_stamp);
-        publishStartPosition(*map, sx, sy);
-        const auto stamp = makeStamp();
-        writeCsvs(*map, *path, planner.path_hops(), planner.path_stances(), stamp);
-        const auto snapshot = writeVisSnapshot(
-          *map, *path, planner.path_hops(), planner.path_stances(), planner.v_g_initial(),
-          sx, sy, tx, ty, stamp, frontier);
-        if (render_png_ && !snapshot.empty()) {
-          renderSnapshot(snapshot);
-        }
-        // What the replan check compares against.
-        active_ = ActivePlan{};
-        active_.valid = path->size() >= 2;
-        active_.frontier = frontier;
-        active_.stamp = now_stamp.seconds();
-        active_.path = *path;
-        active_.hops = planner.path_hops();
-        for (const auto & [x, y] : *path) {
-          const auto [r, c] = map->world_to_grid(x, y);
-          active_.ground.push_back(map->at(r, c));
-        }
-        logReplan(why, frontier ? "frontier plan" : "plan", sx, sy, tx, ty, path->size());
-        failed_plans_ = 0;
-        return true;
+        logHopTable(*planner);
+        r->found = true;
+        r->tx = tx;
+        r->ty = ty;
+        r->frontier = frontier;
+        r->path = std::move(*path);
+        r->map = std::move(map);
+        r->planner = std::move(planner);
+        return r;
       }
-      logReplan(why, "no path", sx, sy, gx, gy, 0);
-      ++failed_plans_;
-      return false;
+      r->tx = gx;
+      r->ty = gy;
+      return r;
     } catch (const std::exception & e) {
-      RCLCPP_ERROR(get_logger(), "Error in planAndPublish: %s", e.what());
-      return false;
+      RCLCPP_ERROR(get_logger(), "Error in search: %s", e.what());
+      r->searched = false;
+      return r;
     }
   }
 
-  // The remaining hops of the active plan against the latest map. "" if they
-  // still hold, else why not.
-  std::string recheckPlan(const ballistic::Map2D5 & map, int first) const
+  // The plan a search found, as the replan check and the publishers see it (no stamp yet).
+  static ActivePlan planOf(const SearchResult & r)
+  {
+    ActivePlan plan;
+    plan.valid = r.path.size() >= 2;
+    plan.frontier = r.frontier;
+    plan.sx = r.sx;
+    plan.sy = r.sy;
+    plan.tx = r.tx;
+    plan.ty = r.ty;
+    plan.path = r.path;
+    plan.hops = r.planner->path_hops();
+    plan.stances = r.planner->path_stances();
+    for (const auto & [x, y] : r.path) {
+      const auto [row, col] = r.map->world_to_grid(x, y);
+      plan.ground.push_back(r.map->at(row, col));
+    }
+    return plan;
+  }
+
+  // HopPlan first, then the marker pair, all with one stamp; plan becomes the active plan.
+  void publishPlan(ActivePlan plan)
+  {
+    if (plan.path.size() < 2) {
+      RCLCPP_WARN(get_logger(),
+        "Path has %zu point(s); hopcopter ignores <2-point trajectories — not publishing.",
+        plan.path.size());
+      return;
+    }
+    const auto now_stamp = now();
+    plan.stamp = now_stamp.seconds();
+    publishHopPlan(plan, now_stamp);
+    publishTrajectory(plan.path, plan.hops, now_stamp);
+    active_ = std::move(plan);
+  }
+
+  // Publish a search's plan, write its CSVs and snapshot, and make it the active plan.
+  void publishResult(const SearchResult & r)
+  {
+    publishPlan(planOf(r));
+    publishStartPosition(r.sx, r.sy, active_.ground.front());
+    recordResult(r);
+    logReplan(r.why, r.frontier ? "frontier plan" : "plan", r.sx, r.sy, r.tx, r.ty, r.path.size());
+    failed_plans_ = 0;
+  }
+
+  // The CSVs and the snapshot (+ PNG) of a search's plan.
+  void recordResult(const SearchResult & r)
+  {
+    const auto & planner = *r.planner;
+    const auto stamp = makeStamp();
+    writeCsvs(*r.map, r.path, planner.path_hops(), planner.path_stances(), stamp);
+    const auto snapshot = writeVisSnapshot(
+      *r.map, r.path, planner.path_hops(), planner.path_stances(), planner.v_g_initial(),
+      r.sx, r.sy, r.tx, r.ty, stamp, r.frontier);
+    if (render_png_ && !snapshot.empty()) {
+      renderSnapshot(snapshot);
+    }
+  }
+
+  // Plan from (sx, sy) to the goal on the latest map and publish it, here and now. Returns
+  // whether a plan went out.
+  bool planAndPublish(double sx, double sy, const std::string & why)
+  {
+    last_plan_time_ = std::chrono::steady_clock::now();
+    const auto r = search(*latest_map_msg_, sx, sy, goal_x_, goal_y_, why);
+    if (r->found) {
+      publishResult(*r);
+      return true;
+    }
+    if (r->searched) {
+      logReplan(why, "no path", sx, sy, goal_x_, goal_y_, 0);
+      ++failed_plans_;
+    }
+    return false;
+  }
+
+  // A failed re-check: the first bad waypoint (see recheckPlan) and why.
+  struct Recheck
+  {
+    int bad = -1;  // -1: the plan holds
+    std::string reason;
+  };
+
+  // The hops of plan from waypoint `first` on, against map. The first bad waypoint is the
+  // landing that fails, the takeoff whose ground moved, or the landing of an arc that no
+  // longer clears (that arc must not be flown).
+  Recheck recheckPlan(const ballistic::Map2D5 & map, const ActivePlan & plan, int first) const
   {
     const auto standable = map.standable_mask(p_.robot_radius, p_.side_clearance, p_.steep_grade);
     const auto inflated = map.inflated_field(p_.robot_radius + p_.side_clearance, p_.steep_grade);
-    const auto & path = active_.path;
+    const auto & path = plan.path;
     char buf[200];
     for (size_t j = std::max(1, first); j < path.size(); ++j) {
       const auto [xs, ys] = path[j - 1];
       const auto [xg, yg] = path[j];
       const auto [rg, cg] = map.world_to_grid(xg, yg);
       const auto [rs, cs] = map.world_to_grid(xs, ys);
+      const int jj = static_cast<int>(j);
       if (!standable[static_cast<size_t>(rg) * map.cols() + cg]) {
         std::snprintf(buf, sizeof(buf), "waypoint %zu (%.2f, %.2f) is no longer standable", j, xg, yg);
-        return buf;
+        return {jj, buf};
       }
       const double tg = map.at(rg, cg), ts = map.at(rs, cs);
-      if (std::abs(tg - active_.ground[j]) > replan_height_tol_) {
-        std::snprintf(buf, sizeof(buf), "waypoint %zu's ground moved %+.3f m", j, tg - active_.ground[j]);
-        return buf;
+      if (std::abs(tg - plan.ground[j]) > replan_height_tol_) {
+        std::snprintf(buf, sizeof(buf), "waypoint %zu's ground moved %+.3f m", j, tg - plan.ground[j]);
+        return {jj, buf};
       }
-      if (j >= 2 && std::abs(ts - active_.ground[j - 1]) > replan_height_tol_) {
+      if (j >= 2 && std::abs(ts - plan.ground[j - 1]) > replan_height_tol_) {
         std::snprintf(buf, sizeof(buf), "waypoint %zu's ground moved %+.3f m", j - 1,
-          ts - active_.ground[j - 1]);
-        return buf;
+          ts - plan.ground[j - 1]);
+        return {jj - 1, buf};
       }
       // The planned arc against the new terrain: a hop planned at its clearance
       // floor fails by a hair on any change, so only a real deficit counts
@@ -414,9 +528,9 @@ private:
         xs, ys, ts, xg, yg, tg, map, inflated, p_.arc_max_step, p_.clearance_active_tol, exempt);
       if (!sampled) {
         std::snprintf(buf, sizeof(buf), "the arc into waypoint %zu leaves the map", j);
-        return buf;
+        return {jj, buf};
       }
-      const double tan_a = std::tan(active_.hops[j - 1].alpha_s);
+      const double tan_a = std::tan(plan.hops[j - 1].alpha_s);
       const double X = sampled->X;
       const double k = (X * tan_a - (tg - ts)) / (X * X);
       double worst = std::numeric_limits<double>::infinity();
@@ -430,18 +544,174 @@ private:
         std::snprintf(buf, sizeof(buf),
           "the arc into waypoint %zu clears the terrain by %.2f m now (needs %.2f)",
           j, worst, p_.bottom_clearance);
-        return buf;
+        return {jj, buf};
       }
     }
-    return "";
+    return {};
   }
 
-  // Hold-and-replan (LiDAR maps). Runs at 10 Hz on the wall clock.
+  // The stance that stops a landing from hop h: a vertical takeoff, as the search's stop at
+  // the goal (hopping_astar.cpp, annotate_path).
+  ballistic::Stance stopStance(const ballistic::Hop & h) const
+  {
+    const double v_z = std::sqrt(std::max(0.0, h.v_g * h.v_g - h.v_h * h.v_h));
+    return ballistic::stance(
+      {h.v_h * std::cos(h.heading), h.v_h * std::sin(h.heading), -v_z}, {0.0, 0.0, 1.0}, p_.k2);
+  }
+
+  // Where to cut a plan whose waypoint `bad` failed: the latest waypoint before it that the
+  // robot can stop on (landing tilt within tau_max for a vertical takeoff) and is not
+  // committed past (its takeoff toward waypoint `committed` was fixed at the apex that chose
+  // it). -1: none.
+  int cutIndex(const ActivePlan & plan, int bad, int committed) const
+  {
+    for (int k = bad - 1; k >= std::max(1, committed); --k) {
+      if (stopStance(plan.hops[static_cast<size_t>(k) - 1]).tilt <= p_.tau_max + 1e-9) {
+        return k;
+      }
+    }
+    return -1;
+  }
+
+  // plan up to waypoint k, ending in a stop there.
+  ActivePlan cutPlan(const ActivePlan & plan, int k) const
+  {
+    const auto n = static_cast<size_t>(k);
+    ActivePlan cut;
+    cut.valid = true;
+    cut.frontier = plan.frontier;
+    cut.cut = true;
+    cut.sx = plan.sx;
+    cut.sy = plan.sy;
+    cut.tx = plan.path[n].first;
+    cut.ty = plan.path[n].second;
+    cut.path.assign(plan.path.begin(), plan.path.begin() + n + 1);
+    cut.hops.assign(plan.hops.begin(), plan.hops.begin() + n);
+    cut.stances.assign(plan.stances.begin(), plan.stances.begin() + n);
+    cut.stances.push_back(stopStance(plan.hops[n - 1]));
+    cut.ground.assign(plan.ground.begin(), plan.ground.begin() + n + 1);
+    return cut;
+  }
+
+  // Publish plan cut at waypoint k, and search on from there in the background.
+  void publishCut(const ActivePlan & plan, int k, const std::string & reason)
+  {
+    const auto cut = cutPlan(plan, k);
+    const auto [cx, cy] = cut.path.back();
+    publishPlan(cut);  // plan may be active_, which this replaces
+    RCLCPP_WARN(get_logger(),
+      "Replanning (%s): path cut at waypoint %d (%.2f, %.2f), landing tilt %.1f deg for the stop; "
+      "searching from there", reason.c_str(), k, cx, cy, cut.stances.back().tilt / kDeg);
+    logReplan(reason, "cut at " + std::to_string(k), cut.sx, cut.sy, cx, cy, cut.path.size());
+    // A search still running started elsewhere: its result is stale.
+    ++cut_gen_;
+    cut_ready_.reset();
+    cut_reason_ = reason;
+    cut_from_ = {cx, cy};
+    cut_needed_ = true;
+    cut_next_start_ = std::chrono::steady_clock::now();
+    startCutSearch();
+  }
+
+  // Forget the cut search (a new goal, or a DELETE): its result will be discarded.
+  void dropCutSearch()
+  {
+    ++cut_gen_;
+    cut_ready_.reset();
+    cut_needed_ = false;
+  }
+
+  // Start the search from the cut waypoint on a worker thread, one at a time.
+  void startCutSearch()
+  {
+    if (!cut_needed_ || cut_future_.valid() || std::chrono::steady_clock::now() < cut_next_start_) {
+      return;
+    }
+    cut_needed_ = false;
+    last_plan_time_ = std::chrono::steady_clock::now();
+    const auto msg = latest_map_msg_;
+    const double sx = cut_from_.first, sy = cut_from_.second;
+    const double gx = goal_x_, gy = goal_y_;
+    const auto why = "replan: " + cut_reason_;
+    const auto gen = cut_gen_;
+    cut_future_ = std::async(std::launch::async, [this, msg, sx, sy, gx, gy, why, gen]() {
+        auto r = search(*msg, sx, sy, gx, gy, why);
+        r->gen = gen;
+        return r;
+      });
+  }
+
+  // Collect a finished cut search. A stale one is discarded; a failed one is retried later.
+  void pollCutSearch()
+  {
+    if (!cut_future_.valid() ||
+      cut_future_.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+    {
+      return;
+    }
+    auto r = cut_future_.get();
+    if (r->gen != cut_gen_) {
+      RCLCPP_INFO(get_logger(), "(%s) Discarding a stale search from (%.2f, %.2f)",
+        r->why.c_str(), r->sx, r->sy);
+      logReplan(r->why, "discarded (stale)", r->sx, r->sy, r->tx, r->ty, r->path.size());
+      return;
+    }
+    if (!r->found) {
+      if (r->searched) {
+        logReplan(r->why, "no path", r->sx, r->sy, goal_x_, goal_y_, 0);
+      }
+      ++failed_plans_;
+      // Try again on a newer map; the robot hops in place on the cut waypoint meanwhile.
+      const double wait = replan_interval_ * std::min(6, 1 << std::min(failed_plans_, 3));
+      cut_next_start_ = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(static_cast<int64_t>(wait * 1000.0));
+      cut_needed_ = true;
+      RCLCPP_WARN(get_logger(), "(%s) No plan from the cut waypoint; searching again in %.0f s",
+        r->why.c_str(), wait);
+      return;
+    }
+    cut_ready_ = std::move(r);
+  }
+
+  // The robot hops in place on the cut waypoint and the search from there is done: re-check
+  // its plan on the latest map, then publish it, or its own cut, or search again.
+  void releaseCutResult()
+  {
+    const auto r = std::move(cut_ready_);
+    auto plan = planOf(*r);
+    const auto map = convertMap(*latest_map_msg_);
+    const auto rc = recheckPlan(*map, plan, 1);
+    if (rc.bad < 0) {
+      RCLCPP_INFO(get_logger(), "(%s) The robot is on the cut waypoint: publishing the rest",
+        r->why.c_str());
+      publishResult(*r);
+      return;
+    }
+    // The robot is on the plan's start, so its first hop is not committed yet.
+    const int k = replan_cut_ ? cutIndex(plan, rc.bad, 1) : -1;
+    recordResult(*r);
+    if (k >= 1) {
+      publishStartPosition(r->sx, r->sy, plan.ground.front());
+      logReplan(r->why, "plan", r->sx, r->sy, r->tx, r->ty, r->path.size());
+      failed_plans_ = 0;
+      publishCut(plan, k, rc.reason);
+      return;
+    }
+    RCLCPP_WARN(get_logger(), "(%s) The new plan failed its re-check (%s): searching again",
+      r->why.c_str(), rc.reason.c_str());
+    logReplan(r->why, "discarded: " + rc.reason, r->sx, r->sy, r->tx, r->ty, r->path.size());
+    cut_reason_ = rc.reason;
+    cut_needed_ = true;
+    startCutSearch();
+  }
+
+  // Replanning on LiDAR maps. Runs at 10 Hz on the wall clock.
   void replanStep()
   {
     if (!replan_enabled_ || !have_goal_ || goal_reached_ || !latest_map_msg_) {
       return;
     }
+    pollCutSearch();
     const auto now_t = std::chrono::steady_clock::now();
     const double since_plan = std::chrono::duration<double>(now_t - last_plan_time_).count();
     if (replan_state_ == ReplanState::kWaitHold) {
@@ -464,6 +734,19 @@ private:
       }
       return;
     }
+    const bool on_active = active_.valid && have_decision_ &&
+      std::abs(decision_.path_id - active_.stamp) < 1e-4;
+    // A cut plan: once the robot hops in place on its last waypoint, the rest goes out.
+    if (on_active && active_.cut && decision_.mode == "goal") {
+      if (cut_ready_) {
+        releaseCutResult();
+        return;
+      }
+      if (!cut_needed_ && !cut_future_.valid()) {
+        cut_needed_ = true;  // nothing on the way (should not happen): search again
+      }
+    }
+    startCutSearch();
     if (!map_changed_ && active_.valid) {
       return;
     }
@@ -475,9 +758,13 @@ private:
       return;
     }
     std::string reason;
-    if (active_.valid && have_decision_ && std::abs(decision_.path_id - active_.stamp) < 1e-4) {
+    if (on_active) {
       const auto map = convertMap(*latest_map_msg_);
       if (decision_.mode == "goal") {
+        if (active_.cut) {
+          map_changed_ = false;
+          return;  // waiting on the cut waypoint for the rest (above)
+        }
         if (active_.frontier) {
           reason = "reached the frontier";
         } else {
@@ -488,9 +775,18 @@ private:
       } else if (decision_.mode == "hold") {
         reason = "the robot gave up on the path (hold)";
       } else if (decision_.mode == "track" || decision_.mode == "retry") {
-        reason = recheckPlan(*map, decision_.land_index);
+        const auto rc = recheckPlan(*map, active_, decision_.land_index);
+        reason = rc.reason;
+        // Keep the good hops: cut before the bad one, at once, and search on from there.
+        const int k = rc.bad < 0 || !replan_cut_ ? -1 : cutIndex(active_, rc.bad, decision_.land_index);
+        if (k >= 1) {
+          map_changed_ = false;
+          pending_reason_.clear();
+          publishCut(active_, k, reason);
+          return;
+        }
       }
-      if (reason.empty() && active_.frontier) {
+      if (reason.empty() && active_.frontier && !active_.cut) {
         const auto standable = map->standable_mask(p_.robot_radius, p_.side_clearance, p_.steep_grade);
         const auto [rg, cg] = map->world_to_grid(goal_x_, goal_y_);
         if (standable[static_cast<size_t>(rg) * map->cols() + cg]) {
@@ -514,6 +810,7 @@ private:
     }
     pending_reason_.clear();
     replan_reason_ = reason;
+    dropCutSearch();
     // DELETE alone: hopcopter drops the path 0.5 s later and hops in place.
     visualization_msgs::msg::Marker del;
     del.header.frame_id = "world";
@@ -613,34 +910,29 @@ private:
   }
 
   // Each hop's takeoff, and the stance the planner computed for it.
-  void publishHopPlan(
-    const ballistic::Map2D5 & map,
-    const std::vector<std::pair<double, double>> & path,
-    const ballistic::HoppingAStarPlanner & planner,
-    const rclcpp::Time & stamp)
+  void publishHopPlan(const ActivePlan & plan, const rclcpp::Time & stamp)
   {
+    const auto & path = plan.path;
     if (path.size() < 2) {
       return;  // no hop, and no marker either (publishTrajectory)
     }
-    const auto & hops = planner.path_hops();
-    const auto & stances = planner.path_stances();
+    const auto & hops = plan.hops;
+    const auto & stances = plan.stances;
     hopcopter_msgs::msg::HopPlan msg;
     msg.header.frame_id = "world";
     msg.header.stamp = stamp;
-    const auto [rs, cs] = map.world_to_grid(path[0].first, path[0].second);
     msg.start.x = path[0].first;
     msg.start.y = path[0].second;
-    msg.start.z = map.at(rs, cs);
+    msg.start.z = plan.ground[0];
     msg.start_speed = hops[0].v_g_in;
     msg.start_axis = toVector3(stances[0].axis);
     msg.start_tilt = stances[0].tilt;
     for (size_t i = 0; i < hops.size(); ++i) {
       const auto & h = hops[i];
       hopcopter_msgs::msg::PlannedHop hop;
-      const auto [r, c] = map.world_to_grid(path[i + 1].first, path[i + 1].second);
       hop.landing.x = path[i + 1].first;
       hop.landing.y = path[i + 1].second;
-      hop.landing.z = map.at(r, c);
+      hop.landing.z = plan.ground[i + 1];
       hop.heading = h.heading;
       hop.alpha_leg = h.alpha_leg;
       hop.v_leg = h.v_leg;
@@ -718,15 +1010,15 @@ private:
       kPathMarkerId, m.points.size());
   }
 
-  void publishStartPosition(const ballistic::Map2D5 & map, double sx, double sy)
+  // ground: the start cell's height
+  void publishStartPosition(double sx, double sy, double ground)
   {
     geometry_msgs::msg::PoseStamped ps;
     ps.header.frame_id = "world";
     ps.header.stamp = now();
     ps.pose.position.x = sx;
     ps.pose.position.y = sy;
-    const auto [r, c] = map.world_to_grid(sx, sy);
-    ps.pose.position.z = map.at(r, c) + hover_offset_;
+    ps.pose.position.z = ground + hover_offset_;
     ps.pose.orientation.w = 1.0;
     start_pub_->publish(ps);
   }
@@ -1001,21 +1293,10 @@ private:
     }
   }
 
-  enum class ReplanState {kIdle, kWaitHold};
-  struct ActivePlan
-  {
-    bool valid = false;
-    bool frontier = false;
-    double stamp = 0.0;  // the marker's stamp [s]: hopcopter's path_id
-    std::vector<std::pair<double, double>> path;
-    std::vector<ballistic::Hop> hops;
-    std::vector<double> ground;  // the map's height at each waypoint when planned
-  };
-
   ballistic::PlannerParams p_;
   ballistic::FrontierParams frontier_;
   int frontier_attempts_ = 2;
-  bool replan_enabled_ = true;
+  bool replan_enabled_ = true, replan_cut_ = true;
   double replan_interval_, replan_height_tol_, replan_hold_wait_, replan_hold_timeout_;
   double goal_x_ = 0.0, goal_y_ = 0.0;
   bool have_goal_ = false, goal_reached_ = false, map_changed_ = false;
@@ -1039,6 +1320,16 @@ private:
   double robot_x_ = 0.0, robot_y_ = 0.0;
   bool have_pose_ = false;
 
+  // The search from a cut waypoint (docs/replan_cut_plan.md). cut_gen_ goes up whenever a
+  // running search goes stale; cut_future_ is last, so it is destroyed (waits for the worker)
+  // before anything the worker uses.
+  std::string cut_reason_;
+  std::pair<double, double> cut_from_{0.0, 0.0};
+  bool cut_needed_ = false;
+  uint64_t cut_gen_ = 0;
+  std::chrono::steady_clock::time_point cut_next_start_;
+  std::unique_ptr<SearchResult> cut_ready_;
+
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr traj_pub_;
   rclcpp::Publisher<hopcopter_msgs::msg::HopPlan>::SharedPtr plan_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr start_pub_;
@@ -1047,6 +1338,7 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub_;
   rclcpp::Subscription<hopcopter_msgs::msg::ApexDecision>::SharedPtr decision_sub_;
   rclcpp::TimerBase::SharedPtr replan_timer_;
+  std::future<std::unique_ptr<SearchResult>> cut_future_;
 };
 
 int main(int argc, char ** argv)

@@ -157,10 +157,26 @@ case: new map areas usually confirm what the plan assumed, or lie off the path.
 | `the robot gave up on the path (hold)` | hopcopter missed a waypoint 3 times and is holding |
 | `no plan yet` | The last attempt failed; try again on the newer map |
 
-Replans are rate-limited: at least 5 s since the last plan (`replan.min_interval`), longer after
-repeated failures (up to 30 s).
+The first three are re-check failures. When the bad waypoint lies past the hop the robot is
+already committed to, the plan is **cut** instead (3.4); otherwise, and for the other reasons,
+it is deleted. Deletes are rate-limited: at least 5 s since the last plan
+(`replan.min_interval`), longer after repeated failures (up to 30 s). Cuts are not.
 
 ### 3.4 What a replan looks like on the wire
+
+**A cut** (docs/replan_cut_plan.md; `replan.cut`, default on):
+
+1. The planner republishes the plan up to the waypoint before the bad one, at once, and logs
+   `Replanning (<reason>): path cut at waypoint K (x, y), landing tilt ... for the stop`. K is the
+   latest waypoint the robot can stop on (a vertical takeoff within the 20° landing tilt) that
+   is not before the waypoint its next hop already aims at.
+2. hopcopter flies the good hops and hops in place on K (`goal`, its path's last waypoint).
+3. Meanwhile the planner searches from K on a worker thread, and keeps re-checking the cut plan
+   (a landing of it going bad cuts again, earlier; the older search is discarded as stale).
+4. Once the search is done **and** hopcopter reports `goal` on K, the planner re-checks the new
+   plan on the newest map and publishes it (or its own cut, or searches again).
+
+**A DELETE** (a bad next landing, the other reasons, or `replan.cut:=false`):
 
 1. Planner publishes a **DELETE alone** on `/ballistic_trajectory` and logs
    `Replanning (<reason>): path deleted, waiting for the robot to hop in place`.
@@ -248,6 +264,7 @@ latest map.
 | `replan.min_interval` | planner | 5.0 s | Minimum time between plans |
 | `replan.height_tolerance` | planner | 0.05 m | Ground change / clearance slack before a replan |
 | `replan.hold_wait` / `replan.hold_timeout` | planner | 1.0 / 4.0 s | How long to wait for the in-place hop before replanning |
+| `replan.cut` | planner | true | Cut the plan before a bad hop and search on in the background; `false`: always DELETE and hold |
 
 The design and the reasons behind these values are in `docs/lidar_mapping_plan.md` and
 `CHANGELOG.md`.
